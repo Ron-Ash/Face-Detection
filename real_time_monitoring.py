@@ -11,47 +11,42 @@ from weaviateClientManager import WeaviateClientManager
 from weaviate.classes.query import MetadataQuery, QueryReference
 
 # ── Config ────────────────────────────────────────────────────────────────────
-
 IDENTIFY_INTERVAL = 1.0
 IOU_THRESHOLD     = 0.3
 MAX_MISSING       = 15
 NO_MATCH_DISTANCE = 0.4
 
 # ── Tracked face ──────────────────────────────────────────────────────────────
-
 @dataclass
 class TrackedFace:
-    track_id:        int
-    bbox:            np.ndarray
-    embedding:       np.ndarray
-    last_seen:       float = field(default_factory=time.time)
+    track_id: int
+    bbox: np.ndarray
+    embedding: np.ndarray
+    last_seen: float = field(default_factory=time.time)
     last_identified: float = 0.0
-    missing_frames:  int   = 0
-    name:            Optional[str]   = None
-    affiliation:     Optional[str]   = None
-    status:          Optional[str]   = None
-    confidence:      Optional[float] = None
-    identifying:     bool            = False
+    missing_frames: int = 0
+    name: Optional[str] = None
+    affiliation: Optional[str] = None
+    status: Optional[str] = None
+    confidence: Optional[float] = None
+    identifying: bool = False
 
 # ── IoU helper ────────────────────────────────────────────────────────────────
-
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
     ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
+    if inter == 0: return 0.0
     return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter)
 
 # ── Tracker ───────────────────────────────────────────────────────────────────
-
 class FaceTracker:
     def __init__(self, face_processing: FaceProcessing, client_manager: WeaviateClientManager):
-        self.fp             = face_processing
+        self.fp = face_processing
         self.client_manager = client_manager
-        self._tracks        = ReadWriteLock(dict())
-        self._next_id       = 0
-        self._id_lock       = threading.Lock()
+        self._tracks = ReadWriteLock(dict())
+        self._next_id = 0
+        self._id_lock = threading.Lock()
         self._identify_pool = ThreadPoolExecutor(max_workers=2)
 
     def _new_id(self) -> int:
@@ -61,7 +56,6 @@ class FaceTracker:
             return tid
 
     # ── Identification ────────────────────────────────────────────────────────
-
     def _identify_async(self, track_id: int, embedding: np.ndarray) -> None:
         try:
             name, affiliation, status, confidence = self._query_weaviate(embedding)
@@ -70,11 +64,11 @@ class FaceTracker:
                 track = tracks.get(track_id)
                 if track is None:
                     return
-                track.name            = name
-                track.affiliation     = affiliation
-                track.status          = status
-                track.confidence      = confidence
-                track.identifying     = False
+                track.name = name
+                track.affiliation = affiliation
+                track.status = status
+                track.confidence = confidence
+                track.identifying = False
                 track.last_identified = time.time()
 
         except Exception as e:
@@ -119,10 +113,9 @@ class FaceTracker:
         )
 
     # ── Per-frame update ──────────────────────────────────────────────────────
-
     def update(self, frame: np.ndarray) -> list[TrackedFace]:
         detections = self.fp.run(frame)
-        now        = time.time()
+        now = time.time()
 
         with self._tracks.write() as tracks:
             self._match_detections(tracks, detections, now)
@@ -144,10 +137,10 @@ class FaceTracker:
                     best_iou, best_idx = iou, i
 
             if best_iou >= IOU_THRESHOLD:
-                det                  = detections[best_idx]
-                track.bbox           = det.bbox
-                track.embedding      = det.embedding
-                track.last_seen      = now
+                det = detections[best_idx]
+                track.bbox = det.bbox
+                track.embedding = det.embedding
+                track.last_seen = now
                 track.missing_frames = 0
                 matched_det_ids.add(best_idx)
             else:
@@ -193,7 +186,6 @@ class FaceTracker:
         self._identify_pool.shutdown(wait=False)
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
-
 def draw_tracks(frame: np.ndarray, tracks: list[TrackedFace]) -> np.ndarray:
     for track in tracks:
         x1, y1, x2, y2 = track.bbox
@@ -207,17 +199,15 @@ def draw_tracks(frame: np.ndarray, tracks: list[TrackedFace]) -> np.ndarray:
             lines.append("Identifying..." if track.identifying else "Unknown")
 
         for j, line in enumerate(lines):
-            cv2.putText(frame, line, (x1, y1 - 10 - j * 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            cv2.putText(frame, line, (x1, y1 - 10 - j * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     return frame
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    fp      = FaceProcessing()
+    fp = FaceProcessing()
     manager = WeaviateClientManager()
     tracker = FaceTracker(fp, manager)
-    cap     = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0)
 
     print("Running — press Q to quit")
     try:
