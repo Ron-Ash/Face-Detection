@@ -44,7 +44,6 @@ def close_conversation(userId: int) -> None:
 
 def handle_payload(userId: int, lastVersion: int) -> None:
     while True:
-        # ── Wait for a new message from handle_message ─────────────────────
         with clientMessageLocks.read() as messages:
             userLock = messages.get(userId)
             if userLock is None:
@@ -54,15 +53,13 @@ def handle_payload(userId: int, lastVersion: int) -> None:
             with userLock.wait_for_update(lastVersion) as currentVersion:
                 lastVersion = currentVersion
         except Exception:
-            return  # lock removed or interrupted; exit cleanly
+            return
 
-        # ── Cancel existing timeout ────────────────────────────────────────
         with clientTimerLocks.read() as userTimers:
             timer = userTimers.get(userId)
             if timer:
                 timer.interrupt()
 
-        # ── Read state and run state machine ──────────────────────────────
         with clientMessageLocks.read() as messages:
             userLock = messages.get(userId)
             if userLock is None:
@@ -70,12 +67,10 @@ def handle_payload(userId: int, lastVersion: int) -> None:
             with userLock.read() as currentState:
                 newState, _ = conversation_state_machine(currentState)
 
-        # ── Write new state back ───────────────────────────────────────────
         with clientMessageLocks.write() as messages:
             if userId in messages:
                 messages[userId].set_silent(newState)
 
-        # ── (Re)start timeout timer ────────────────────────────────────────
         with clientTimerLocks.write() as userTimers:
             timer = userTimers.get(userId)
             if timer:
@@ -108,49 +103,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     loop  = asyncio.get_running_loop()
 
-    newUser = False
+    spawnWorker  = False
+    signalWorker = False   # whether to bump version and wake existing worker
 
     with clientMessageLocks.write() as messages:
         clientStateLock = messages.get(user.id)
 
         if clientStateLock is None:
-            messages[user.id] = ReadWriteLock(ConversationState(user.id, msg, loop))
-            newUser = True
-            clientStateLock = messages.get(user.id)
-        # ── Existing conversation: update state ────────────────────────
-        err      = None
-        newState = None
+            # ── Brand new user — create state and spawn worker ─────────────
+            initialState = ConversationState(user.id, msg, loop)
+            if image is not None:
+                initialState = initialState.with_image(image)
+            messages[user.id] = ReadWriteLock(initialState)
+            clientStateLock = messages[user.id]
+            spawnWorker = True
+            signalWorker = True
 
-        with clientStateLock.write() as state:
-            state.message=msg
-            
-            if text.strip().lower() == "exit":
-                newState = state.reset()
-            elif image is not None:
-                newState = state.with_image(image)
-            elif state.needs_command:
-                newState, err = state.with_command(text)
-            elif state.needs_metadata:
-                newState, err = state.with_metadata(text)
-            else:
-                # Nothing expected right now — tell the user
-                asyncio.run_coroutine_threadsafe(
-                    msg.reply_text("I'm not expecting input right now."), loop
-                )
-                if not newUser: return
+        else:
+            # ── Existing conversation — compute next state ─────────────────
+            err      = None
+            newState = None
 
-        if err:
-            asyncio.run_coroutine_threadsafe(msg.reply_text(err), loop)
-        elif newState is not None:
-            clientStateLock.value = newState
+            with clientStateLock.write() as state:
+                state.message = msg
 
-    if newUser: 
+                if text.strip().lower() == "exit":
+                    newState = state.reset()
+                elif image is not None:
+                    newState = state.with_image(image)
+                elif state.stage in ("awaiting_match_confirm", "awaiting_new_confirm"):
+                    newState, err = state.with_confirmation(text)
+                elif state.stage == "awaiting_metadata":
+                    newState, err = state.with_metadata(text)
+                else:
+                    asyncio.run_coroutine_threadsafe(
+                        msg.reply_text("I'm not expecting input right now."), loop
+                    )
+
+            if err:
+                asyncio.run_coroutine_threadsafe(msg.reply_text(err), loop)
+            elif newState is not None:
+                clientStateLock.value = newState   # bumps version, wakes worker
+                signalWorker = True
+
+    # ── Spawn worker outside the lock ─────────────────────────────────────────
+    if spawnWorker:
+        # For new users, manually bump version so wait_for_update(0) unblocks
+        clientStateLock.value = clientStateLock.value  # re-set to bump version
         loop.run_in_executor(gpu_executor, handle_payload, user.id, 0)
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-            
 
 
 if __name__ == "__main__":
