@@ -1,7 +1,7 @@
-venv/
+env/
 
 telegram_token.txt
 telegram_users.txt
 
-*/__pycache__/*
-__pycache__/*
+*/__pycache__/
+__pycache__/
