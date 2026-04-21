@@ -5,7 +5,6 @@ import numpy as np
 from telegram import Message
 
 from faceProcessing import FaceProcessing
-from weaviate.classes.query import MetadataQuery
 from weaviateClientManager import WeaviateClientManager
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 
@@ -121,20 +120,20 @@ CLASS_NAME = "Faces"
 def upload_face(image: np.ndarray, name: str, affiliation: str, status: str):
     results = FaceProcessing().run(image)
     if not results: return
+
     with weaviateClientManager._call() as client:
         if not client.collections.exists(CLASS_NAME):
             client.collections.create(
                 name=CLASS_NAME,
+                vectorizer_config=Configure.Vectorizer.none(),
+                vector_index_config=Configure.VectorIndex.hnsw(
+                    distance_metric=VectorDistances.COSINE
+                ),
                 properties=[
                     Property(name="name", data_type=DataType.TEXT),
                     Property(name="affiliation", data_type=DataType.TEXT),
                     Property(name="status", data_type=DataType.TEXT)
-                ],
-                vector_config=Configure.Vectors.none(
-                    vector_index_config=Configure.VectorIndex.hnsw(
-                        distance_metric=VectorDistances.COSINE
-                    )
-                )
+                ]
             )
         collection = client.collections.get(CLASS_NAME)
         for result in results:
@@ -143,40 +142,23 @@ def upload_face(image: np.ndarray, name: str, affiliation: str, status: str):
                 vector=result.embedding.tolist()
             )
 
-
-def search_face(image: object) -> str:
+def search_face(image: np.ndarray):
     results = FaceProcessing().run(image)
-    if not results:
-        return "No face detected in image."
-    
+    if not results: return
+
     queryVector = np.mean([r.embedding for r in results], axis=0)
-    
+
     with weaviateClientManager._call() as client:
         collection = client.collections.get(CLASS_NAME)
-        response = collection.query.near_vector(
-            near_vector=queryVector.tolist(),
-            limit=1,
-            return_metadata=MetadataQuery(distance=True, certainty=True)  
-        )
-        
-        if not response.objects:
-            return "No match found in database."
-        
-        obj        = response.objects[0]
-        properties = obj.properties
-        name        = properties.get("name")
-        affiliation = properties.get("affiliation")
-        status      = properties.get("status")
-        
-        distance  = obj.metadata.distance   # 0.0 = identical, 1.0 = completely different
-        certainty = obj.metadata.certainty  # 1.0 = identical, 0.0 = completely different
-        confidence_pct = round((1 - distance) * 100, 1)
-        
-        return (
-            f"Possible Identification:\n"
-            f"\t{name}: {status} ({affiliation})\n"
-            f"\tConfidence: {confidence_pct}% (certainty: {certainty:.3f})"
-        )
+
+        response = collection.query.near_vector(near_vector=queryVector.tolist(), limit=1)
+
+        if response.objects:
+            properties = response.objects[0].properties
+            name = properties.get("name")
+            affiliation = properties.get("affiliation")
+            status = properties.get("status")
+            return f"Possible Identification:\n\t{name}: {status} ({affiliation})"
 
 # ── State machine ─────────────────────────────────────────────────────────────
 
