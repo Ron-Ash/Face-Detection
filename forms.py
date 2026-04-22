@@ -1,3 +1,10 @@
+"""
+forms.py
+────────
+Tkinter forms for confirming or creating a tracked person.
+All persistence is delegated to weaviate_store and minio_store.
+"""
+
 from __future__ import annotations
 
 import tkinter
@@ -9,17 +16,23 @@ import weaviate
 from minio import Minio
 from PIL import Image, ImageTk
 
-
 from database import minio_store, weaviate_store
-from trackedFace import TrackedFace
+from facialRecognition.trackedFace import TrackedFace
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _resize_thumbnail(img: Image.Image, max_size: int = 96) -> Image.Image:
     out = img.copy()
     out.thumbnail((max_size, max_size), Image.LANCZOS)
     return out
 
+
 def _image_sharpness_score(img: Image.Image) -> float:
+    """Variance of the Laplacian — higher means sharper."""
     import numpy as np
     gray = img.convert("L")
     arr = np.array(gray, dtype=np.float32)
@@ -32,13 +45,21 @@ def _image_sharpness_score(img: Image.Image) -> float:
     return float(np.var(lap))
 
 
-def _fetch_display_images(wv_client: weaviate.WeaviateClient, mn_client: Minio, embedding: np.ndarray, limit: int = 8, distance_threshold: float = 0.45) -> list[tuple[Image.Image, float]]:
+def _fetch_display_images(
+    wv_client: weaviate.WeaviateClient,
+    mn_client: Minio,
+    embedding: np.ndarray,
+    limit: int = 8,
+    distance_threshold: float = 0.45,
+) -> list[tuple[Image.Image, float]]:
     """
     1. Ask Weaviate for the closest FaceEmbedding object keys near *embedding*.
     2. Download the corresponding images from MinIO.
     3. Return (image, distance) pairs sorted by sharpness descending.
     """
-    key_dist_pairs = weaviate_store.query_embeddings_for_person(wv_client, embedding, limit=limit, distance_threshold=distance_threshold)
+    key_dist_pairs = weaviate_store.query_embeddings_for_person(
+        wv_client, embedding, limit=limit, distance_threshold=distance_threshold
+    )
     if not key_dist_pairs:
         return []
 
@@ -125,10 +146,12 @@ def update_form(
     inner = tkinter.Frame(canvas, bg="#f0f0f0")
     canvas.create_window((0, 0), window=inner, anchor="nw")
 
-    _thumb_refs: list = []
+    def _populate_thumbnails(images: list) -> None:
+        """Called on the Tk main thread once the background fetch completes."""
+        # Clear the loading indicator
+        for w in inner.winfo_children():
+            w.destroy()
 
-    def _load_thumbnails() -> None:
-        images = _fetch_display_images(wv_client, mn_client, tracked.embedding, limit=8)
         if not images:
             tkinter.Label(inner, text="No stored images found.", bg="#f0f0f0", fg="#888").pack(
                 side="left", padx=8, pady=8
@@ -137,10 +160,11 @@ def update_form(
             for img, dist in images[:6]:
                 thumb = _resize_thumbnail(img, THUMB_SIZE)
                 tk_thumb = ImageTk.PhotoImage(thumb)
-                _thumb_refs.append(tk_thumb)
                 col_frame = tkinter.Frame(inner, bg="#f0f0f0")
                 col_frame.pack(side="left", padx=4, pady=4)
-                tkinter.Label(col_frame, image=tk_thumb, bg="#f0f0f0").pack()
+                lbl = tkinter.Label(col_frame, image=tk_thumb, bg="#f0f0f0")
+                lbl.image = tk_thumb  # attach ref to widget — prevents GC
+                lbl.pack()
                 tkinter.Label(
                     col_frame, text=f"{(1 - dist) * 100:.0f}%",
                     bg="#f0f0f0", fg="#555", font=("Helvetica", 7)
@@ -149,7 +173,23 @@ def update_form(
         inner.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox("all"))
 
-    window.after(50, _load_thumbnails)
+    def _fetch_in_background() -> None:
+        """Runs on a daemon thread — does the blocking network calls, then
+        schedules _populate_thumbnails back onto the Tk main thread."""
+        try:
+            images = _fetch_display_images(wv_client, mn_client, tracked.embedding, limit=8)
+        except Exception as e:
+            print(f"[update_form] thumbnail fetch error: {e}")
+            images = []
+        # window.after is thread-safe; it queues the call onto the Tk event loop
+        window.after(0, lambda: _populate_thumbnails(images))
+
+    # Show a loading indicator immediately, then kick off the background fetch
+    tkinter.Label(inner, text="Loading…", bg="#f0f0f0", fg="#aaa").pack(
+        side="left", padx=8, pady=8
+    )
+    import threading as _threading
+    _threading.Thread(target=_fetch_in_background, daemon=True).start()
 
     # ── Yes / No buttons ──────────────────────────────────────────────────────
     btn_frame = tkinter.Frame(window)
