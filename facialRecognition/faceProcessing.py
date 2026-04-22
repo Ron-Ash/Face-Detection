@@ -16,7 +16,7 @@ class FaceResult:
 
 class FaceProcessing:
     def __init__(self, threshold: float = 0.6):
-        self.app = FaceAnalysis(name="buffalo_l")
+        self.app = FaceAnalysis(name="buffalo_l", allowed_modules=["detection", "recognition"])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
         self.threshold = threshold
 
