@@ -3,15 +3,16 @@ from dataclasses import dataclass
 import asyncio
 import numpy as np
 from telegram import Message
+from weaviate import WeaviateClient
+from minio import Minio
 
 from faceProcessing import FaceProcessing
-from weaviateClientManager import WeaviateClientManager
-from weaviate.classes.config import Configure, Property, DataType, ReferenceProperty, VectorDistances
 from weaviate.classes.query import MetadataQuery, QueryReference
-import uuid
+import weaviate_store
+import minio_store
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
-_PROMPT_IMAGE = "Please upload an image to be processed."
+_PROMPT_IMAGE    = "Please upload an image to be processed."
 _PROMPT_METADATA = (
     "Please provide the following metadata:\n"
     "\t name:        <person's name>\n"
@@ -19,39 +20,40 @@ _PROMPT_METADATA = (
     "\t status:      [Approved | Unapproved | Unknown]"
 )
 _ERR_METADATA = "Invalid metadata. Please use the given format."
-_ERR_CONFIRM = "Please reply 'yes' or 'no'."
+_ERR_CONFIRM  = "Please reply 'yes' or 'no'."
 
 _VALID_STATUSES = {"approved", "unapproved", "unknown"}
+
+NO_MATCH_DISTANCE = 0.40
+
 
 # ── State ─────────────────────────────────────────────────────────────────────
 @dataclass
 class ConversationState:
-    userId: str
+    userId:  str
     message: Message
-    loop: asyncio.AbstractEventLoop
+    loop:    asyncio.AbstractEventLoop
 
-    image: np.ndarray | None = None
-    # Flow control
-    # Stages: None → "searching" → "confirm_match" → "confirm_new" → "needs_metadata" → done
-    stage: str | None = None
+    image:    np.ndarray | None = None
+    # Stages (in order):
+    #   None → "searching" → "confirm_match" | "confirm_new"
+    #        → "awaiting_match_confirm" | "awaiting_new_confirm"
+    #        → "add_to_existing" | "needs_metadata"
+    #        → "awaiting_metadata" → "add_new_person" → reset
+    stage:    str | None = None
     metadata: dict | None = None
 
-    # Populated after search
-    match_uuid: str | None = None   # UUID of best Weaviate Person match
-    match_name: str | None = None
-    match_affiliation:str | None = None
-    match_status: str | None = None
+    match_uuid:       str | None   = None
+    match_name:       str | None   = None
+    match_affiliation:str | None   = None
+    match_status:     str | None   = None
     match_confidence: float | None = None
-    match_embedding: list | None  = None   # the averaged query vector
+    match_embedding:  list | None  = None
 
-    # ── Derived properties ────────────────────────────────────────────────────
+    # ── Derived ───────────────────────────────────────────────────────────────
     @property
     def needs_image(self) -> bool:
         return self.image is None
-
-    @property
-    def needs_metadata(self) -> bool:
-        return self.stage == "needs_metadata" and not self._metadata_valid()
 
     def _metadata_valid(self) -> bool:
         required = {"name", "affiliation", "status"}
@@ -86,21 +88,23 @@ class ConversationState:
         if answer not in {"yes", "no"}:
             return self, _ERR_CONFIRM
 
-        if self.stage == "awaiting_match_confirm":   # ← was "confirm_match"
+        if self.stage == "awaiting_match_confirm":
             if answer == "yes":
                 return self._copy(stage="add_to_existing"), None
             else:
+                # Rejected the match — ask whether to add as new person instead
                 return self._copy(stage="confirm_new"), None
 
-        if self.stage == "awaiting_new_confirm":     # ← was "confirm_new"
-            if answer == "yes": return self._copy(stage="needs_metadata"), None
+        if self.stage == "awaiting_new_confirm":
+            if answer == "yes":
+                return self._copy(stage="needs_metadata"), None
             else:
                 return self.reset(), None
 
         return self, _ERR_CONFIRM
 
     def with_metadata(self, text: str) -> tuple[ConversationState, str | None]:
-        fields = {}
+        fields: dict[str, str] = {}
         for line in text.strip().splitlines():
             if ":" in line:
                 key, _, value = line.partition(":")
@@ -114,168 +118,147 @@ class ConversationState:
         return ConversationState(userId=self.userId, message=self.message, loop=self.loop)
 
 
-# ── Weaviate ──────────────────────────────────────────────────────────────────
-weaviateClientManager = WeaviateClientManager()
-NO_MATCH_DISTANCE = 0.05   # distances above this are treated as no confident match
+# ── Search ────────────────────────────────────────────────────────────────────
 
-def setup_collections(client) -> None:
-    if not client.collections.exists("Person"):
-        client.collections.create(
-            name="Person",
-            properties=[
-                Property(name="name",        data_type=DataType.TEXT),
-                Property(name="affiliation", data_type=DataType.TEXT),
-                Property(name="status",      data_type=DataType.TEXT),
-            ]
-        )
-    if not client.collections.exists("FaceEmbedding"):
-        client.collections.create(
-            name="FaceEmbedding",
-            properties=[Property(name="source_image", data_type=DataType.TEXT)],
-            references=[ReferenceProperty(name="person", target_collection="Person")],
-            vector_config=Configure.Vectors.self_provided(
-                vector_index_config=Configure.VectorIndex.hnsw(
-                    distance_metric=VectorDistances.COSINE
-                )
-            )
-        )
-
-def _create_person(client, name: str, affiliation: str, status: str) -> str:
-    person_uuid = str(uuid.uuid4())
-    client.collections.get("Person").data.insert(
-        properties={"name": name, "affiliation": affiliation, "status": status},
-        uuid=person_uuid
-    )
-    return person_uuid
-
-def _add_embedding(client, embedding: list, person_uuid: str) -> None:
-    client.collections.get("FaceEmbedding").data.insert(
-        properties={"source_image": ""},
-        vector=embedding,
-        references={"person": person_uuid}
-    )
-
-def search_and_stage(state: ConversationState) -> ConversationState:
+def search_and_stage(
+    state: ConversationState,
+    wv_client: WeaviateClient,
+    fp: FaceProcessing,
+) -> ConversationState:
     """
-    Run face detection + Weaviate search on state.image.
-    Returns a new state staged at 'confirm_match' or 'confirm_new'
-    depending on whether a confident match was found.
+    Run face detection on state.image, query Weaviate via weaviate_store,
+    and return a new state staged at "confirm_match" or "confirm_new".
+    MinIO is not needed here — image storage only happens on confirmation.
     """
-    results = FaceProcessing().run(state.image)
+    results = fp.run(state.image)
     if not results:
         return state._copy(stage="no_face")
 
     query_vector = np.mean([r.embedding for r in results], axis=0).tolist()
 
-    with weaviateClientManager._call() as client:
-        setup_collections(client)
+    person_uuid, name, affiliation, status, confidence = weaviate_store.query_nearest_person(
+        wv_client,
+        np.array(query_vector),
+        distance_threshold=NO_MATCH_DISTANCE,
+    )
 
-        embeddings = client.collections.get("FaceEmbedding")
-        response = embeddings.query.near_vector(
-            near_vector=query_vector,
-            limit=1,
-            return_metadata=MetadataQuery(distance=True),
-            return_references=QueryReference(
-                link_on="person",
-                return_properties=["name", "affiliation", "status"]
-            )
-        )
-
-    # No records in DB yet or no match
-    if not response.objects:
-        return state._copy(
-            stage="confirm_new",
-            match_embedding=query_vector
-        )
-
-    obj  = response.objects[0]
-    dist = obj.metadata.distance
-
-    if dist > NO_MATCH_DISTANCE:
-        return state._copy(
-            stage="confirm_new",
-            match_embedding=query_vector
-        )
-
-    # Confident match found — extract person details
-    person_refs = obj.references.get("person")
-    if not person_refs or not person_refs.objects:
+    if person_uuid is None:
+        # No confident match — ask whether to register as new
         return state._copy(stage="confirm_new", match_embedding=query_vector)
-
-    props = person_refs.objects[0].properties
-    person_uuid = str(person_refs.objects[0].uuid)
 
     return state._copy(
         stage="confirm_match",
         match_uuid=person_uuid,
-        match_name=props.get("name"),
-        match_affiliation=props.get("affiliation"),
-        match_status=props.get("status"),
-        match_confidence=round((1 - dist) * 100, 1),
+        match_name=name,
+        match_affiliation=affiliation,
+        match_status=status,
+        match_confidence=confidence,
         match_embedding=query_vector,
     )
 
 
 # ── State machine ─────────────────────────────────────────────────────────────
 
-def conversation_state_machine(state: ConversationState) -> tuple[ConversationState, bool]:
+def conversation_state_machine(
+    state: ConversationState,
+    wv_client: WeaviateClient,
+    mn_client: Minio,
+    fp: FaceProcessing,
+) -> tuple[ConversationState, bool]:
+    """
+    Drive the conversation one step forward.
+    Returns (new_state, done).
+
+    Both wv_client and mn_client are caller-owned; this function never
+    opens or closes either connection.
+    """
 
     def reply(text: str) -> None:
         asyncio.run_coroutine_threadsafe(
             state.message.reply_text(text), state.loop
         )
 
+    def _pil_from_state() -> "Image.Image | None":
+        """Convert the numpy BGR frame stored in state to a PIL RGB image."""
+        if state.image is None:
+            return None
+        from PIL import Image
+        import cv2
+        rgb = cv2.cvtColor(state.image, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb)
+
     if state.needs_image:
         reply(_PROMPT_IMAGE)
         return state, False
 
+    # ── searching ─────────────────────────────────────────────────────────────
     if state.stage == "searching":
-        new_state = search_and_stage(state)
-        return conversation_state_machine(new_state)  # ← key fix
+        new_state = search_and_stage(state, wv_client, fp)
+        # Recurse once so the match/no-match prompt is sent in the same call
+        return conversation_state_machine(new_state, wv_client, mn_client, fp)
 
+    # ── no face detected ──────────────────────────────────────────────────────
     if state.stage == "no_face":
         reply("No face detected in that image. Please try another.")
         return state.reset(), False
 
+    # ── present match to user ─────────────────────────────────────────────────
     if state.stage == "confirm_match":
         reply(
             f"I found a possible match:\n"
-            f"\t{state.match_name} | {state.match_status} ({state.match_affiliation})\n"
-            f"\tConfidence: {state.match_confidence}%\n\n"
+            f"  {state.match_name}  |  {state.match_status}  ({state.match_affiliation})\n"
+            f"  Confidence: {state.match_confidence}%\n\n"
             f"Is this the same person? (yes / no)"
         )
         return state._copy(stage="awaiting_match_confirm"), False
 
+    # ── ask whether to add as new person ─────────────────────────────────────
     if state.stage == "confirm_new":
         reply("No confident match found. Would you like to add this as a new person? (yes / no)")
         return state._copy(stage="awaiting_new_confirm"), False
 
+    # ── waiting for user input — nothing to do yet ────────────────────────────
     if state.stage in ("awaiting_match_confirm", "awaiting_new_confirm", "awaiting_metadata"):
         return state, False
 
+    # ── confirmed existing match — upload image and link new embedding ────────
     if state.stage == "add_to_existing":
-        with weaviateClientManager._call() as client:
-            setup_collections(client)
-            _add_embedding(client, state.match_embedding, state.match_uuid)
+        pil_img = _pil_from_state()
+        if pil_img is not None:
+            object_key = minio_store.upload_image(mn_client, pil_img, state.match_uuid)
+            weaviate_store.add_face_embedding(
+                wv_client, state.match_uuid, np.array(state.match_embedding), object_key
+            )
         reply(f"✅ New image added to {state.match_name}'s record.")
         return state.reset(), False
 
+    # ── ask for metadata before creating new person ───────────────────────────
     if state.stage == "needs_metadata":
         reply(_PROMPT_METADATA)
         return state._copy(stage="awaiting_metadata"), False
 
+    # ── metadata received — create person, upload image, store embedding ──────
     if state.stage == "add_new_person":
-        with weaviateClientManager._call() as client:
-            setup_collections(client)
-            person_uuid = _create_person(
-                client,
-                state.metadata["name"],
-                state.metadata["affiliation"],
-                state.metadata["status"],
-            )
-            _add_embedding(client, state.match_embedding, person_uuid)
-        reply(f"✅ {state.metadata['name']} added to the database.")
+        name        = state.metadata["name"]
+        affiliation = state.metadata["affiliation"]
+        status      = state.metadata["status"]
+
+        # 1. Create Person in Weaviate
+        person_uuid = weaviate_store.create_person(wv_client, name, affiliation, status)
+
+        # 2. Upload image to MinIO
+        pil_img    = _pil_from_state()
+        img_to_store = pil_img if pil_img is not None else __import__("PIL.Image", fromlist=["Image"]).Image.new("RGB", (64, 64))
+        object_key = minio_store.upload_image(mn_client, img_to_store, person_uuid)
+
+        # 3. Store embedding + MinIO key in Weaviate
+        weaviate_store.add_face_embedding(
+            wv_client, person_uuid, np.array(state.match_embedding), object_key
+        )
+
+        reply(f"✅ {name} added to the database.")
         return state.reset(), False
 
+    # ── fallback ──────────────────────────────────────────────────────────────
     reply("Something went wrong. Please start again by sending an image.")
     return state.reset(), False
