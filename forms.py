@@ -1,13 +1,7 @@
-"""
-forms.py
-────────
-Tkinter forms for confirming or creating a tracked person.
-All persistence is delegated to weaviate_store and minio_store.
-"""
-
 from __future__ import annotations
 
 import tkinter
+import threading
 from tkinter import ttk
 from typing import Optional
 
@@ -20,11 +14,6 @@ from database import minio_store, weaviate_store
 from facialRecognition.trackedFace import TrackedFace
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _resize_thumbnail(img: Image.Image, max_size: int = 96) -> Image.Image:
     out = img.copy()
     out.thumbnail((max_size, max_size), Image.LANCZOS)
@@ -32,8 +21,6 @@ def _resize_thumbnail(img: Image.Image, max_size: int = 96) -> Image.Image:
 
 
 def _image_sharpness_score(img: Image.Image) -> float:
-    """Variance of the Laplacian — higher means sharper."""
-    import numpy as np
     gray = img.convert("L")
     arr = np.array(gray, dtype=np.float32)
     kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
@@ -45,18 +32,7 @@ def _image_sharpness_score(img: Image.Image) -> float:
     return float(np.var(lap))
 
 
-def _fetch_display_images(
-    wv_client: weaviate.WeaviateClient,
-    mn_client: Minio,
-    embedding: np.ndarray,
-    limit: int = 8,
-    distance_threshold: float = 0.45,
-) -> list[tuple[Image.Image, float]]:
-    """
-    1. Ask Weaviate for the closest FaceEmbedding object keys near *embedding*.
-    2. Download the corresponding images from MinIO.
-    3. Return (image, distance) pairs sorted by sharpness descending.
-    """
+def _fetch_display_images(wv_client: weaviate.WeaviateClient, mn_client: Minio, embedding: np.ndarray, limit: int = 8, distance_threshold: float = 0.45) -> list[tuple[Image.Image, float]]:
     key_dist_pairs = weaviate_store.query_embeddings_for_person(
         wv_client, embedding, limit=limit, distance_threshold=distance_threshold
     )
@@ -71,29 +47,17 @@ def _fetch_display_images(
     results.sort(key=lambda t: _image_sharpness_score(t[0]), reverse=True)
     return results
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# update_form  –  "Is this the right person?"
-# ─────────────────────────────────────────────────────────────────────────────
-
-def update_form(
-    root: tkinter.Tk,
-    wv_client: weaviate.WeaviateClient,
-    mn_client: Minio,
-    fid: int,
-    tracked: TrackedFace,
-    pil_img: Optional[Image.Image],
-) -> None:
+def update_form(root: tkinter.Tk, wv_client: weaviate.WeaviateClient, mn_client: Minio, fid: int, tracked: TrackedFace, pil_img: Optional[Image.Image]) -> None:
     """
-    Show the matched identity alongside the live capture and stored images.
+    Confirm or edit an existing person's identity.
 
     Layout
     ──────
     Row 0-4  │ col 0 : live capture
-             │ col 1-2 : name / affiliation / status / confidence (read-only)
+             │ col 1-2 : editable name / affiliation / status + confidence (read-only)
     Row 5    │ col 0-2 : "Stored images" header
     Row 6    │ col 0-2 : scrollable thumbnail strip (from MinIO)
-    Row 7    │ col 0-2 : [✓ Yes — add image]  [✗ No — new person]
+    Row 7    │ col 0-2 : [✓ Yes — save & add image]  [✗ No — new person]
     """
     window = tkinter.Toplevel(root)
     window.title(f"Confirm Identity — Track {fid}")
@@ -115,20 +79,49 @@ def update_form(
             row=0, column=0, rowspan=5, padx=10, pady=10
         )
 
-    # ── Identity fields ───────────────────────────────────────────────────────
+    # ── Identity fields (editable) ────────────────────────────────────────────
     fp = {"padx": 6, "pady": 3}
     tkinter.Label(window, text=f"Track ID: {fid}", font=("Helvetica", 10, "bold")).grid(
         row=0, column=1, columnspan=2, sticky="w", **fp
     )
 
-    def _ro_field(row: int, label: str, value: str) -> None:
-        tkinter.Label(window, text=label, anchor="e", width=12).grid(row=row, column=1, sticky="e", **fp)
-        tkinter.Label(window, text=value or "—", anchor="w", fg="#333").grid(row=row, column=2, sticky="w", **fp)
+    def _field(row: int, label: str, default: str) -> tkinter.Entry:
+        tkinter.Label(window, text=label, anchor="e", width=12).grid(
+            row=row, column=1, sticky="e", **fp
+        )
+        entry = tkinter.Entry(window, width=22)
+        entry.insert(0, default)
+        entry.grid(row=row, column=2, sticky="w", **fp)
+        return entry
 
-    _ro_field(1, "Name:",        tracked.name or "Unknown")
-    _ro_field(2, "Affiliation:", tracked.affiliation or "—")
-    _ro_field(3, "Status:",      tracked.status or "—")
-    _ro_field(4, "Confidence:",  f"{tracked.confidence:.1f}%" if tracked.confidence is not None else "—")
+    name_entry = _field(1, "Name:",        tracked.name or "")
+    aff_entry  = _field(2, "Affiliation:", tracked.affiliation or "")
+
+    tkinter.Label(window, text="Status:", anchor="e", width=12).grid(
+        row=3, column=1, sticky="e", **fp
+    )
+    status_var = tkinter.StringVar(value=tracked.status or "unknown")
+    ttk.Combobox(
+        window,
+        textvariable=status_var,
+        values=["approved", "unapproved", "unknown"],
+        state="readonly",
+        width=19,
+    ).grid(row=3, column=2, sticky="w", **fp)
+
+    # Confidence is derived from the match distance — not editable
+    tkinter.Label(window, text="Confidence:", anchor="e", width=12).grid(
+        row=4, column=1, sticky="e", **fp
+    )
+    tkinter.Label(
+        window,
+        text=f"{tracked.confidence:.1f}%" if tracked.confidence is not None else "—",
+        anchor="w", fg="#555",
+    ).grid(row=4, column=2, sticky="w", **fp)
+
+    # Inline error label (hidden until needed)
+    error_label = tkinter.Label(window, text="", fg="#c62828", font=("Helvetica", 9))
+    error_label.grid(row=4, column=1, columnspan=2, sticky="s")
 
     # ── Stored images strip ───────────────────────────────────────────────────
     tkinter.Label(
@@ -147,11 +140,8 @@ def update_form(
     canvas.create_window((0, 0), window=inner, anchor="nw")
 
     def _populate_thumbnails(images: list) -> None:
-        """Called on the Tk main thread once the background fetch completes."""
-        # Clear the loading indicator
         for w in inner.winfo_children():
             w.destroy()
-
         if not images:
             tkinter.Label(inner, text="No stored images found.", bg="#f0f0f0", fg="#888").pack(
                 side="left", padx=8, pady=8
@@ -163,48 +153,74 @@ def update_form(
                 col_frame = tkinter.Frame(inner, bg="#f0f0f0")
                 col_frame.pack(side="left", padx=4, pady=4)
                 lbl = tkinter.Label(col_frame, image=tk_thumb, bg="#f0f0f0")
-                lbl.image = tk_thumb  # attach ref to widget — prevents GC
+                lbl.image = tk_thumb  # prevent GC
                 lbl.pack()
                 tkinter.Label(
                     col_frame, text=f"{(1 - dist) * 100:.0f}%",
                     bg="#f0f0f0", fg="#555", font=("Helvetica", 7)
                 ).pack()
-
         inner.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _fetch_in_background() -> None:
-        """Runs on a daemon thread — does the blocking network calls, then
-        schedules _populate_thumbnails back onto the Tk main thread."""
         try:
             images = _fetch_display_images(wv_client, mn_client, tracked.embedding, limit=8)
         except Exception as e:
             print(f"[update_form] thumbnail fetch error: {e}")
             images = []
-        # window.after is thread-safe; it queues the call onto the Tk event loop
         window.after(0, lambda: _populate_thumbnails(images))
 
-    # Show a loading indicator immediately, then kick off the background fetch
     tkinter.Label(inner, text="Loading…", bg="#f0f0f0", fg="#aaa").pack(
         side="left", padx=8, pady=8
     )
-    import threading as _threading
-    _threading.Thread(target=_fetch_in_background, daemon=True).start()
+    threading.Thread(target=_fetch_in_background, daemon=True).start()
 
     # ── Yes / No buttons ──────────────────────────────────────────────────────
     btn_frame = tkinter.Frame(window)
     btn_frame.grid(row=7, column=0, columnspan=3, pady=10)
 
     def on_yes() -> None:
-        """Upload the captured image to MinIO and link it to the person in Weaviate."""
+        """
+        Persist any edited fields to Weaviate, then upload the captured image
+        and link a new embedding. Updates the in-memory tracker too.
+        """
+        name        = name_entry.get().strip()
+        affiliation = aff_entry.get().strip()
+        status      = status_var.get()
+
+        if not name:
+            error_label.config(text="Name is required.")
+            return
+
+        person_uuid = weaviate_store.get_person_uuid_for_embedding(wv_client, tracked.embedding)
+        if not person_uuid:
+            error_label.config(text="Could not resolve person — try again.")
+            print("[update_form] Could not resolve person UUID.")
+            return
+
+        # Update Person properties in Weaviate if anything changed
+        changed = (
+            name        != (tracked.name        or "") or
+            affiliation != (tracked.affiliation  or "") or
+            status      != (tracked.status       or "")
+        )
+        if changed:
+            weaviate_store.update_person(wv_client, person_uuid,
+                                         name=name, affiliation=affiliation, status=status)
+            print(f"[update_form] Updated Person:{person_uuid} — name={name}, "
+                  f"affiliation={affiliation}, status={status}")
+
+        # Upload image and add embedding regardless of whether fields changed
         if pil_img is not None:
-            person_uuid = weaviate_store.get_person_uuid_for_embedding(wv_client, tracked.embedding)
-            if person_uuid:
-                object_key = minio_store.upload_image(mn_client, pil_img, person_uuid)
-                weaviate_store.add_face_embedding(wv_client, person_uuid, tracked.embedding, object_key)
-                print(f"[update_form] Saved → MinIO:{object_key}, Person:{person_uuid}")
-            else:
-                print("[update_form] Could not resolve person UUID — image not saved.")
+            object_key = minio_store.upload_image(mn_client, pil_img, person_uuid)
+            weaviate_store.add_face_embedding(wv_client, person_uuid, tracked.embedding, object_key)
+            print(f"[update_form] Saved → MinIO:{object_key}, Person:{person_uuid}")
+
+        # Keep in-memory tracker in sync
+        tracked.name        = name
+        tracked.affiliation = affiliation
+        tracked.status      = status
+
         window.destroy()
 
     def on_no() -> None:
@@ -212,7 +228,7 @@ def update_form(
         create_form(root, wv_client, mn_client, fid, tracked, pil_img)
 
     tkinter.Button(
-        btn_frame, text="✓  Yes — add image to this person",
+        btn_frame, text="✓  Yes — save & add image",
         bg="#2e7d32", fg="white", font=("Helvetica", 10, "bold"),
         padx=10, pady=4, command=on_yes,
     ).pack(side="left", padx=12)
@@ -224,25 +240,7 @@ def update_form(
     ).pack(side="left", padx=12)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# create_form  –  Register a brand-new person
-# ─────────────────────────────────────────────────────────────────────────────
-
-def create_form(
-    root: tkinter.Tk,
-    wv_client: weaviate.WeaviateClient,
-    mn_client: Minio,
-    fid: int,
-    tracked: TrackedFace,
-    pil_img: Optional[Image.Image],
-) -> None:
-    """
-    Register a new Person.
-    On save:
-      1. Create Person in Weaviate  → person_uuid
-      2. Upload image to MinIO      → object_key
-      3. Insert FaceEmbedding in Weaviate linking person_uuid + object_key
-    """
+def create_form(root: tkinter.Tk, wv_client: weaviate.WeaviateClient, mn_client: Minio, fid: int, tracked: TrackedFace, pil_img: Optional[Image.Image]) -> None:
     window = tkinter.Toplevel(root)
     window.title(f"New Person — Track {fid}")
 

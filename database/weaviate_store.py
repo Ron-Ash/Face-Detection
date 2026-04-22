@@ -1,10 +1,3 @@
-"""
-weaviate_store.py
-─────────────────
-All Weaviate operations: Person CRUD, FaceEmbedding CRUD, and vector queries.
-The caller is responsible for opening and closing the client.
-"""
-
 from __future__ import annotations
 
 from typing import Optional
@@ -15,28 +8,14 @@ import weaviate
 from weaviate.classes.query import MetadataQuery, QueryReference
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Person
-# ─────────────────────────────────────────────────────────────────────────────
-
-def create_person(
-    client: weaviate.WeaviateClient,
-    name: str,
-    affiliation: str,
-    status: str,
-) -> str:
-    """Insert a Person document and return its UUID string."""
+def create_person(client: weaviate.WeaviateClient, name: str, affiliation: str, status: str) -> str:
     uuid = client.collections.get("Person").data.insert(
         properties={"name": name, "affiliation": affiliation, "status": status}
     )
     return str(uuid)
 
 
-def get_person(
-    client: weaviate.WeaviateClient,
-    person_uuid: str,
-) -> Optional[dict]:
-    """Fetch a Person by UUID. Returns a dict of properties, or None if not found."""
+def get_person(client: weaviate.WeaviateClient, person_uuid: str) -> Optional[dict]:
     try:
         obj = client.collections.get("Person").query.fetch_object_by_id(
             uuid=person_uuid,
@@ -50,19 +29,13 @@ def get_person(
         return None
 
 
-def update_person(
-    client: weaviate.WeaviateClient,
-    person_uuid: str,
-    name: Optional[str] = None,
-    affiliation: Optional[str] = None,
-    status: Optional[str] = None,
-) -> bool:
+def update_person(client: weaviate.WeaviateClient, person_uuid: str, name: Optional[str] = None, affiliation: Optional[str] = None, status: Optional[str] = None) -> bool:
     """Partial-update a Person's properties. Returns True on success."""
     try:
         props = {}
-        if name is not None:        props["name"] = name
+        if name is not None: props["name"] = name
         if affiliation is not None: props["affiliation"] = affiliation
-        if status is not None:      props["status"] = status
+        if status is not None: props["status"] = status
         client.collections.get("Person").data.update(uuid=person_uuid, properties=props)
         return True
     except Exception as e:
@@ -71,7 +44,6 @@ def update_person(
 
 
 def delete_person(client: weaviate.WeaviateClient, person_uuid: str) -> bool:
-    """Delete a Person by UUID. Returns True on success."""
     try:
         client.collections.get("Person").data.delete_by_id(uuid=person_uuid)
         return True
@@ -80,21 +52,7 @@ def delete_person(client: weaviate.WeaviateClient, person_uuid: str) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FaceEmbedding
-# ─────────────────────────────────────────────────────────────────────────────
-
-def add_face_embedding(
-    client: weaviate.WeaviateClient,
-    person_uuid: str,
-    embedding: np.ndarray,
-    minio_object_key: str,
-) -> str:
-    """
-    Insert a FaceEmbedding linked to a Person.
-    Stores the MinIO object key (not raw image data) in source_image.
-    Returns the new embedding UUID string.
-    """
+def add_face_embedding(client: weaviate.WeaviateClient, person_uuid: str, embedding: np.ndarray, minio_object_key: str) -> str:
     uuid = client.collections.get("FaceEmbedding").data.insert(
         properties={"source_image": minio_object_key},
         vector=embedding.tolist(),
@@ -104,7 +62,6 @@ def add_face_embedding(
 
 
 def delete_face_embedding(client: weaviate.WeaviateClient, embedding_uuid: str) -> bool:
-    """Delete a FaceEmbedding by UUID. Returns True on success."""
     try:
         client.collections.get("FaceEmbedding").data.delete_by_id(uuid=embedding_uuid)
         return True
@@ -113,23 +70,7 @@ def delete_face_embedding(client: weaviate.WeaviateClient, embedding_uuid: str) 
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Queries
-# ─────────────────────────────────────────────────────────────────────────────
-
-def query_nearest_person(
-    client: weaviate.WeaviateClient,
-    embedding: np.ndarray,
-    distance_threshold: float = 0.4,
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[float]]:
-    """
-    Find the closest Person to *embedding*.
-
-    Returns
-    -------
-    (person_uuid, name, affiliation, status, confidence_pct)
-    All fields are None if no match is found within *distance_threshold*.
-    """
+def query_nearest_person(client: weaviate.WeaviateClient, embedding: np.ndarray, distance_threshold: float = 0.4) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[float]]:
     try:
         response = client.collections.get("FaceEmbedding").query.near_vector(
             near_vector=embedding.tolist(),
@@ -167,22 +108,7 @@ def query_nearest_person(
         return None, None, None, None, None
 
 
-def query_embeddings_for_person(
-    client: weaviate.WeaviateClient,
-    embedding: np.ndarray,
-    limit: int = 8,
-    distance_threshold: float = 0.45,
-) -> list[tuple[str, float]]:
-    """
-    Return all FaceEmbedding records that belong to the same Person as
-    *embedding*, identified by first resolving the person UUID then fetching
-    all embeddings linked to that UUID.
-
-    Returns
-    -------
-    List of (minio_object_key, distance) sorted by distance ascending.
-    An empty list is returned if no confident person match is found or on error.
-    """
+def query_embeddings_for_person(client: weaviate.WeaviateClient, embedding: np.ndarray, limit: int = 8, distance_threshold: float = 0.45) -> list[tuple[str, float]]:
     try:
         # Step 1: resolve which person this embedding belongs to
         person_uuid = get_person_uuid_for_embedding(client, embedding, distance_threshold)
@@ -218,11 +144,6 @@ def query_embeddings_for_person(
         return []
 
 
-def get_person_uuid_for_embedding(
-    client: weaviate.WeaviateClient,
-    embedding: np.ndarray,
-    distance_threshold: float = 0.4,
-) -> Optional[str]:
-    """Convenience wrapper: return just the Person UUID for the closest match."""
+def get_person_uuid_for_embedding(client: weaviate.WeaviateClient, embedding: np.ndarray, distance_threshold: float = 0.4) -> Optional[str]:
     person_uuid, *_ = query_nearest_person(client, embedding, distance_threshold)
     return person_uuid
